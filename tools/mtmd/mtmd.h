@@ -149,6 +149,9 @@ MTMD_API bool mtmd_support_vision(const mtmd_context * ctx);
 // whether the current model supports audio input
 MTMD_API bool mtmd_support_audio(const mtmd_context * ctx);
 
+// video frames and the audio track are interleaved at 1 fps
+MTMD_API bool mtmd_video_interleave_audio(const mtmd_context * ctx);
+
 // get audio sample rate in Hz, for example 16000 for Whisper
 // return -1 if audio is not supported
 MTMD_API int mtmd_get_audio_sample_rate(const mtmd_context * ctx);
@@ -325,6 +328,26 @@ DEPRECATED(MTMD_API int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tok
 // returns 1 on generic error
 MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
                                    const mtmd_input_chunk * chunk);
+
+// Youtu video: the audio chunk that belongs to this frame (same file, same second),
+// or null when this image should be encoded on its own.
+MTMD_API const mtmd_input_chunk * mtmd_youtu_video_pair_audio(const mtmd_context * ctx,
+                                                              const mtmd_input_chunks * chunks,
+                                                              size_t image_index);
+
+// Encode that frame and its second of audio together. Vision embeddings are left
+// in mtmd_get_output_embd(); the audio embeddings are kept until mtmd_encode_chunk()
+// is called on the audio chunk. Returns 0 on success.
+MTMD_API int32_t mtmd_encode_youtu_video_pair(mtmd_context * ctx,
+                                              const mtmd_input_chunk * image,
+                                              const mtmd_input_chunk * audio);
+
+// Drop audio embeddings left over from an earlier prompt.
+MTMD_API void mtmd_youtu_fused_audio_reset(mtmd_context * ctx);
+
+// True when mtmd_encode_chunk() will return the fused audio instead of encoding again.
+MTMD_API bool mtmd_youtu_fused_audio_ready(const mtmd_context * ctx,
+                                           const mtmd_input_chunk * chunk);
 
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:

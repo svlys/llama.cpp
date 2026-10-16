@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+from typing import Callable, Iterable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import Tensor
+
+from .base import MmprojModel, ModelBase, gguf
+
+
+@ModelBase.register("YoutuVITAForCausalLM")
+@ModelBase.example("tencent/Youtu-Parsing-Omni")
+class YoutuOmniVisionModel(MmprojModel):
+    """Vision and audio towers for Youtu-Parsing-Omni.
+
+    Both modalities share one bidirectional transformer stored under
+    ``omni_config``. The file keeps a single copy of that transformer under
+    the vision tensor names. The audio context loads those same tensors and
+    adds the conv stem plus the audio merger.
+    """
+
+    has_audio_encoder = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.hparams_vision is not None
+        # Native resolution is dynamic. image_size is only the metadata fallback.
+        self.hparams_vision["image_size"] = self.preprocessor_config.get("image_size", 448)
+
+    def get_vision_config(self):
+        return self.global_config.get("omni_config")
+
+    def get_audio_config(self):
+        # audio_config is JSON null; the conv stem and the shared transformer
+        # both read omni_config.
+        return self.global_config.get("omni_config")
+
+    def set_gguf_parameters(self):
+        mean = self.preprocessor_config.get("mean")
+        std = self.preprocessor_config.get("std")
+        if mean is not None and "image_mean" not in self.preprocessor_config:
+            self.preprocessor_config["image_mean"] = mean
+        if std is not None and "image_std" not in self.preprocessor_config:
+            self.preprocessor_config["image_std"] = std
+
+        super().set_gguf_parameters()
+
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.YOUTU_OMNI)
+        self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams.get("rms_norm_eps", 1e-6))
+        self.gguf_writer.add_vision_use_silu(True)
+        self.gguf_writer.add_vision_spatial_merge_size(self.hparams.get("spatial_merge_size", 2))
+        self.gguf_writer.add_vision_head_count_kv(self.hparams["num_key_value_heads"])
+        self.gguf_writer.add_vision_head_dim(self.hparams.get("head_dim", 128))
+
+        min_pixels = self.preprocessor_config.get("min_pixels")
+        max_pixels = self.preprocessor_config.get("max_pixels")
+        if min_pixels is not None:
+            self.gguf_writer.add_vision_min_pixels(int(min_pixels))
+        if max_pixels is not None:
+            self.gguf_writer.add_vision_max_pixels(int(max_pixels))
+        self.gguf_writer.add_vision_image_resize_algo("bicubic")
+
+        self.gguf_writer.add_audio_num_mel_bins(int(self.hparams.get("num_mel_bins", 128)))
+        self.gguf_writer.add_audio_head_dim(int(self.hparams.get("head_dim", 128)))
+        self.gguf_writer.add_audio_attention_layernorm_eps(float(self.hparams.get("rms_norm_eps", 1e-6)))
+        self.gguf_writer.add_uint32(
+            "clip.audio.attention.head_count_kv",
+            int(self.hparams["num_key_value_heads"]),
+        )
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name = item[0]
+        if not (
+            name.startswith("model.omni_model.vision_embeddings.")
+            or name.startswith("model.omni_model.encoder.")
+            or name.startswith("model.omni_model.vision_merger.")
+            or name.startswith("model.omni_model.audio_embeddings.")
+            or name.startswith("model.omni_model.audio_merger.")
+        ):
+            return None
+        return super().filter_tensors(item)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Linear(C*P*P, hidden) stored as a conv kernel. ggml reads ne[0] as KW.
+        if name.endswith("vision_embeddings.patch_embedding.weight"):
+            out_features, in_features = data_torch.shape
+            patch_size = int(self.hparams["patch_size"])
+            channels = int(self.hparams.get("num_channels", 3))
+            expected = channels * patch_size * patch_size
+            if in_features != expected:
+                raise ValueError(f"Unexpected patch embedding shape {tuple(data_torch.shape)}, expected in_features={expected}")
+            data_torch = data_torch.reshape(out_features, channels, patch_size, patch_size).contiguous()
+
+        # Conv kernels stay in PyTorch [OC, IC, KH, KW] order: the GGUF writer
+        # stores the last dimension as ne[0], which is ggml's [KW, KH, IC, OC].
+        if "audio_embeddings.conv2d" in name and (name.endswith(".weight") or name.endswith(".bias")):
+            which = name.split("conv2d", 1)[1].split(".", 1)[0]
+            if name.endswith(".bias"):
+                data_torch = data_torch.reshape(data_torch.shape[0], 1, 1)
+                yield f"a.conv2d.{which}.bias", data_torch
+            else:
+                yield f"a.conv2d.{which}.weight", data_torch
+            return
+        if name.endswith("audio_embeddings.linear_proj.weight"):
+            yield "a.conv_out.weight", data_torch
+            return
+        if name.endswith("audio_merger.norm.weight"):
+            yield "a.mm.norm.weight", data_torch
+            return
+        if name.endswith("audio_merger.linear_fc1.weight"):
+            yield "a.mm.fc1.weight", data_torch
+            return
+        if name.endswith("audio_merger.linear_fc2.weight"):
+            yield "a.mm.fc2.weight", data_torch
+            return
+        yield from super().modify_tensors(data_torch, name, bid)

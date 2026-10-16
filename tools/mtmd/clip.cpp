@@ -702,6 +702,11 @@ ggml_tensor * clip_graph::build_ffn(
 
     if (down) {
         cur = build_mm(down, cur);
+        // SwiGLU outputs can exceed the f16 range. Metal's tiled matmul converts
+        // that input to half, so the down projection must stay in f32.
+        if (model.proj_type == PROJECTOR_TYPE_YOUTU_OMNI) {
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
+        }
     }
 
     if (down_b) {
@@ -1170,6 +1175,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
         case PROJECTOR_TYPE_YOUTUVL:
             {
                 builder = std::make_unique<clip_graph_youtuvl>(ctx, img);
+            } break;
+        case PROJECTOR_TYPE_YOUTU_OMNI:
+            {
+                builder = std::make_unique<clip_graph_youtu_omni>(ctx, img);
             } break;
         case PROJECTOR_TYPE_YASA2:
             {
@@ -1849,6 +1858,28 @@ struct clip_model_loader {
                         // note: the step3vl preprocessor slices based on a fixed window grid, so it does not support custom min/max image tokens
                         hparams.warmup_image_size = hparams.image_size;
                     } break;
+                case PROJECTOR_TYPE_YOUTU_OMNI:
+                    {
+                        hparams.rope_theta = 10000.0f;
+                        if (is_audio) {
+                            hparams.ffn_op = FFN_SILU;
+                            log_ffn_op = "silu";
+                            hparams.audio_sample_rate = 16000;
+                            hparams.audio_n_fft       = 400;
+                            hparams.audio_window_len  = 400;
+                            hparams.audio_hop_len     = 160;
+                            hparams.warmup_audio_size = 100; // one exact conv chunk
+                        } else {
+                            hparams.n_merge = 2;
+                            hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                            hparams.image_resize_pad  = PAD_NONE;
+                            get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                            get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
+                            get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
+                            // one merge-aligned tile is enough to build the graph
+                            hparams.warmup_image_size = std::max(hparams.patch_size * hparams.n_merge, 32);
+                        }
+                    } break;
                 case PROJECTOR_TYPE_YOUTUVL:
                     {
                         hparams.n_merge = 2;
@@ -2270,9 +2301,13 @@ struct clip_model_loader {
         }
 
         // TODO @ngxson : support both audio and video in the future
+        // Youtu omni stores one copy of the shared transformer under the vision names.
         const char * prefix = model.modality == CLIP_MODALITY_AUDIO ? "a"
                              : model.modality == CLIP_MODALITY_GEN_AUDIO ? "a.gen.code"
                              : "v";
+        if (model.proj_type == PROJECTOR_TYPE_YOUTU_OMNI && model.modality == CLIP_MODALITY_AUDIO) {
+            prefix = "v";
+        }
 
         // get offsets
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
@@ -2727,6 +2762,36 @@ struct clip_model_loader {
                     model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));  // merger.mlp.2
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                } break;
+            case PROJECTOR_TYPE_YOUTU_OMNI:
+                {
+                    if (model.modality == CLIP_MODALITY_AUDIO) {
+                        model.conv2d_1_w = get_tensor(string_format(TN_CONV2D, 1, "weight"));
+                        model.conv2d_1_b = get_tensor(string_format(TN_CONV2D, 1, "bias"));
+                        model.conv2d_2_w = get_tensor(string_format(TN_CONV2D, 2, "weight"));
+                        model.conv2d_2_b = get_tensor(string_format(TN_CONV2D, 2, "bias"));
+                        model.conv2d_3_w = get_tensor(string_format(TN_CONV2D, 3, "weight"));
+                        model.conv2d_3_b = get_tensor(string_format(TN_CONV2D, 3, "bias"));
+                        model.conv_out_w = get_tensor(string_format(TN_CONV_OUT, "weight"));
+                        model.mm_input_norm_w = get_tensor("a.mm.norm.weight");
+                        model.mm_merger_fc1_w = get_tensor("a.mm.fc1.weight");
+                        model.mm_merger_fc2_w = get_tensor("a.mm.fc2.weight");
+                    } else {
+                        model.mm_input_norm_w  = get_tensor(TN_MM_INP_NORM);
+                        model.mm_merger_fc1_w  = get_tensor(string_format(TN_MM_MERGER_FC1, "weight"));
+                        model.mm_merger_fc2_w  = get_tensor(string_format(TN_MM_MERGER_FC2, "weight"));
+                        // Audio stem, so one video frame and its second of audio can share this transformer.
+                        model.conv2d_1_w = get_tensor(string_format(TN_CONV2D, 1, "weight"), false);
+                        model.conv2d_1_b = get_tensor(string_format(TN_CONV2D, 1, "bias"), false);
+                        model.conv2d_2_w = get_tensor(string_format(TN_CONV2D, 2, "weight"), false);
+                        model.conv2d_2_b = get_tensor(string_format(TN_CONV2D, 2, "bias"), false);
+                        model.conv2d_3_w = get_tensor(string_format(TN_CONV2D, 3, "weight"), false);
+                        model.conv2d_3_b = get_tensor(string_format(TN_CONV2D, 3, "bias"), false);
+                        model.conv_out_w = get_tensor(string_format(TN_CONV_OUT, "weight"), false);
+                        model.youtu_a_norm_w = get_tensor("a.mm.norm.weight", false);
+                        model.youtu_a_fc1_w  = get_tensor("a.mm.fc1.weight", false);
+                        model.youtu_a_fc2_w  = get_tensor("a.mm.fc2.weight", false);
+                    }
                 } break;
             case PROJECTOR_TYPE_YASA2:
                 {
@@ -4290,6 +4355,8 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             return (img->nx() / params.patch_size) / 2;
+        case PROJECTOR_TYPE_YOUTU_OMNI:
+            return img->nx() / (params.patch_size * params.n_merge);
         case PROJECTOR_TYPE_STEP3VL:
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
@@ -4320,6 +4387,8 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             return (img->ny() / params.patch_size) / 2;
+        case PROJECTOR_TYPE_YOUTU_OMNI:
+            return img->ny() / (params.patch_size * params.n_merge);
         case PROJECTOR_TYPE_STEP3VL:
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
@@ -4408,6 +4477,20 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 int x_patch = img->nx() / (params.patch_size * 2);
                 int y_patch = img->ny() / (params.patch_size * 2);
                 n_patches = x_patch * y_patch;
+            } break;
+        case PROJECTOR_TYPE_YOUTU_OMNI:
+            {
+                if (ctx->model.modality == CLIP_MODALITY_AUDIO) {
+                    const int n_valid = img->audio_n_frames > 0 ? img->audio_n_frames : img->nx();
+                    n_patches = clip_youtu_omni_audio_tokens(n_valid);
+                } else {
+                    n_patches /= params.n_merge * params.n_merge;
+                    if (img->youtu_joint_mel) {
+                        const int valid = img->youtu_joint_mel_valid > 0
+                            ? img->youtu_joint_mel_valid : img->youtu_joint_mel_frames;
+                        n_patches += clip_youtu_omni_audio_tokens(valid);
+                    }
+                }
             } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
@@ -5180,6 +5263,121 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 }
 
                 set_input_i32("positions", positions);
+            } break;
+        case PROJECTOR_TYPE_YOUTU_OMNI:
+            {
+                const int n_rot = hparams.n_embd_head / 2;
+                if (model.modality == CLIP_MODALITY_AUDIO) {
+                    const int n_valid = imgs.entries[0].audio_n_frames > 0
+                        ? imgs.entries[0].audio_n_frames : image_size_width;
+                    const int n_keep = clip_youtu_omni_audio_tokens(n_valid);
+                    const int n_chunks = image_size_width / 100;
+                    const int per = n_rot / 3;
+                    const int secs[3] = {per, per, n_rot - per * 2};
+                    const float base = hparams.rope_theta > 0.0f ? hparams.rope_theta : 10000.0f;
+                    std::vector<float> factors(n_rot, 1.0f);
+                    int pair = 0;
+                    for (int s = 0; s < 3; s++) {
+                        const int d = secs[s];
+                        for (int k = 0; k < d; k++, pair++) {
+                            factors[pair] = powf(base, k * (1.0f / d - 2.0f / n_rot));
+                        }
+                    }
+                    set_input_f32("youtu_omni_rope_factors", factors);
+
+                    std::vector<int> positions(n_keep * 4, 0);
+                    int ptr = 0;
+                    for (int c = 0; c < n_chunks; c++) {
+                        const int n_this = (c + 1 == n_chunks) ? (n_keep - (n_chunks - 1) * 13) : 13;
+                        for (int t = 0; t < n_this; t++, ptr++) {
+                            positions[ptr] = t;
+                        }
+                    }
+                    set_input_i32("positions", positions);
+
+                    std::vector<float> mask((size_t) n_keep * n_keep, std::numeric_limits<float>::lowest());
+                    int off = 0;
+                    for (int c = 0; c < n_chunks; c++) {
+                        const int n_this = (c + 1 == n_chunks) ? (n_keep - (n_chunks - 1) * 13) : 13;
+                        for (int i = 0; i < n_this; i++) {
+                            for (int j = 0; j < n_this; j++) {
+                                mask[(size_t) (off + i) * n_keep + (off + j)] = 0.0f;
+                            }
+                        }
+                        off += n_this;
+                    }
+                    set_input_attn_mask(mask);
+                    break;
+                }
+                const int pw = image_size_width  / patch_size;
+                const int ph = image_size_height / patch_size;
+                const int per = n_rot / 3;
+                const int secs[3] = {per, per, n_rot - per * 2};
+                const float base = hparams.rope_theta > 0.0f ? hparams.rope_theta : 10000.0f;
+                // VISION rope uses theta_scale = base^(-2/n_dims), n_dims = head_dim/2.
+                // Chunked MTHW wants base^(-k/d) inside each section of length d.
+                std::vector<float> factors(n_rot, 1.0f);
+                int pair = 0;
+                for (int s = 0; s < 3; s++) {
+                    const int d = secs[s];
+                    for (int k = 0; k < d; k++, pair++) {
+                        factors[pair] = powf(base, k * (1.0f / d - 2.0f / n_rot));
+                    }
+                }
+                set_input_f32("youtu_omni_rope_factors", factors);
+
+                // A video pair appends that second of audio after the frame.
+                // Both cursors start at 0, so one frame stays at t = 0 and audio is 0..n-1.
+                const bool joint = imgs.entries[0].youtu_joint_mel != nullptr;
+                const int n_audio = joint
+                    ? clip_youtu_omni_audio_tokens(imgs.entries[0].youtu_joint_mel_valid > 0
+                        ? imgs.entries[0].youtu_joint_mel_valid
+                        : imgs.entries[0].youtu_joint_mel_frames)
+                    : 0;
+                const int n_seq = n_pos + n_audio;
+
+                std::vector<int32_t> order(n_pos);
+                std::vector<int> positions(n_seq * 4, 0);
+                int ptr = 0;
+                for (int y = 0; y < ph; y += 2) {
+                    for (int x = 0; x < pw; x += 2) {
+                        for (int dy = 0; dy < 2; dy++) {
+                            for (int dx = 0; dx < 2; dx++) {
+                                order[ptr] = (y + dy) * pw + (x + dx);
+                                positions[              ptr] = 0;
+                                positions[    n_seq + ptr] = y + dy;
+                                positions[2 * n_seq + ptr] = x + dx;
+                                ptr++;
+                            }
+                        }
+                    }
+                }
+                for (int t = 0; t < n_audio; t++) {
+                    positions[n_pos + t] = t;
+                }
+                set_input_i32("youtu_omni_order", order);
+                set_input_i32("positions", positions);
+
+                if (joint) {
+                    // Non-fusion layers: the frame and the audio are separate segments.
+                    // Fusion layers do not use this mask.
+                    std::vector<float> mask((size_t) n_seq * n_seq, std::numeric_limits<float>::lowest());
+                    for (int i = 0; i < n_pos; i++) {
+                        for (int j = 0; j < n_pos; j++) {
+                            mask[(size_t) i * n_seq + j] = 0.0f;
+                        }
+                    }
+                    for (int i = 0; i < n_audio; i++) {
+                        for (int j = 0; j < n_audio; j++) {
+                            mask[(size_t) (n_pos + i) * n_seq + (n_pos + j)] = 0.0f;
+                        }
+                    }
+                    set_input_attn_mask(mask);
+
+                    const auto & paired = imgs.entries[0];
+                    const size_t n_mel = (size_t) paired.youtu_joint_mel_frames * (size_t) paired.youtu_joint_mel_bins;
+                    set_input_f32("youtu_joint_mel", std::vector<float>(paired.youtu_joint_mel, paired.youtu_joint_mel + n_mel));
+                }
             } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
@@ -6339,6 +6537,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_YOUTUVL:
             return ctx->model.mm_1_b->ne[0];
+        case PROJECTOR_TYPE_YOUTU_OMNI:
+            return ctx->model.mm_merger_fc2_w->ne[1];
         case PROJECTOR_TYPE_QWEN3VL:
             // main path + deepstack paths
             return ctx->model.mm_1_b->ne[0] * (1 + ctx->model.n_deepstack_layers);

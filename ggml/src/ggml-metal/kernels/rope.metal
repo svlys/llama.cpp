@@ -276,18 +276,27 @@ kernel void kernel_rope_vision(
         if (i0 < 2*args.n_dims) { // different from kernel_rope_multi
             const int ic = i0/2;
 
-            // mrope theta calculations (only support 2 dimensions)
-            const int sect_dims = args.sect_0 + args.sect_1;
-            const int sector    = ic % sect_dims;
+            // one frequency restart per section; position channels are T, H, W, extra
+            const int sect_dims = args.sect_0 + args.sect_1 + args.sect_2 + args.sect_3;
+            const int sec_h     = args.sect_0;
+            const int sec_w     = sec_h + args.sect_1;
+            const int sec_e     = sec_w + args.sect_2;
+            const int sector    = sect_dims > 0 ? ic % sect_dims : ic;
 
             float p;
             float theta_base;
-            if (sector < args.sect_1) {
+            if (sector < sec_h) {
                 p = (float) sector;
                 theta_base = (float) pos[i2];
-            } else {
-                p = (float) sector - args.sect_0;
+            } else if (sector < sec_w) {
+                p = (float) (sector - sec_h);
                 theta_base = (float) pos[i2 + args.ne02];
+            } else if (sector < sec_e) {
+                p = (float) (sector - sec_w);
+                theta_base = (float) pos[i2 + 2 * args.ne02];
+            } else {
+                p = (float) (sector - sec_e);
+                theta_base = (float) pos[i2 + 3 * args.ne02];
             }
 
             const float theta = theta_base * pow(args.freq_base, 2.0f * inv_ndims * p);

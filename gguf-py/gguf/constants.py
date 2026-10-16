@@ -6325,6 +6325,7 @@ class VisionProjectorType:
     GLM4V = "glm4v"
     GLM5V = "glm5v"
     YOUTUVL = "youtuvl"
+    YOUTU_OMNI = "youtu_omni"
     NEMOTRON_V2_VL = "nemotron_v2_vl"
     NEMOTRON_OMNI = "nemotron_omni"
     QWEN3TTS_SPKENC = "qwen3tts_spkenc" # audio: ECAPA-TDNN speaker encoder

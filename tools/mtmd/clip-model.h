@@ -805,6 +805,10 @@ struct clip_model {
     ggml_tensor * conv2d_2_b = nullptr;
     ggml_tensor * conv2d_3_w = nullptr;
     ggml_tensor * conv2d_3_b = nullptr;
+    // youtu omni video fusion: audio merger, loaded into the vision context
+    ggml_tensor * youtu_a_norm_w = nullptr;
+    ggml_tensor * youtu_a_fc1_w  = nullptr;
+    ggml_tensor * youtu_a_fc2_w  = nullptr;
 
     // qwen3tts speaker encoder (ECAPA-TDNN)
     // reused tensors: stem conv is conv1d_1_w/b, feature aggregation is conv_out_w/b, output proj is mm_fc_w/b

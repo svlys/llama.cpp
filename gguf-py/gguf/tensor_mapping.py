@@ -1783,6 +1783,7 @@ class TensorNameMap:
             "vision_model.conv1", # Step3-VL
             "model.vision_embedder.patch_dense", # gemma4 unified
             "model.vision_tower.patch_embedder.patch_embedding", # muse-glimmer
+            "model.omni_model.vision_embeddings.patch_embedding", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_NORM: (
@@ -1858,6 +1859,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.q_proj.linear", # gemma4
             "model.qwen2_model.model.model.layers.{bid}.self_attn.q_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.attn.q_proj", # muse-glimmer
+            "model.omni_model.encoder.layers.{bid}.self_attn.q_proj", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_Q_NORM: (
@@ -1866,6 +1868,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.attention.q_norm", # Intern-S1
             "visual.blocks.{bid}.attn.q_norm", # GLM-OCR
             "vision_model.model.layers.{bid}.self_attn.q_norm", # gemma4
+            "model.omni_model.encoder.layers.{bid}.self_attn.q_norm", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_K: (
@@ -1887,6 +1890,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.k_proj.linear", # gemma4
             "model.qwen2_model.model.model.layers.{bid}.self_attn.k_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.attn.k_proj", # muse-glimmer
+            "model.omni_model.encoder.layers.{bid}.self_attn.k_proj", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_K_NORM: (
@@ -1895,6 +1899,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.attention.k_norm", # Intern-S1
             "visual.blocks.{bid}.attn.k_norm", # GLM-OCR
             "vision_model.model.layers.{bid}.self_attn.k_norm", # gemma4
+            "model.omni_model.encoder.layers.{bid}.self_attn.k_norm", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_V: (
@@ -1916,6 +1921,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.v_proj.linear", # gemma4
             "model.qwen2_model.model.model.layers.{bid}.self_attn.v_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.attn.v_proj", # muse-glimmer
+            "model.omni_model.encoder.layers.{bid}.self_attn.v_proj", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_INPUT_NORM: (
@@ -1943,6 +1949,7 @@ class TensorNameMap:
             "vision_model.transformer.resblocks.{bid}.ln_1", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.input_layernorm", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.norm1", # muse-glimmer
+            "model.omni_model.encoder.layers.{bid}.input_layernorm", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_O: (
@@ -1972,6 +1979,7 @@ class TensorNameMap:
             "vision_encoder.blocks.{bid}.attn.proj", # dots3note
             "vision_model.transformer.resblocks.{bid}.attn.out_proj", # Step3-VL
             "model.vision_tower.layers.{bid}.attn.proj", # muse-glimmer
+            "model.omni_model.encoder.layers.{bid}.self_attn.o_proj", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_SINKS: (
@@ -2004,6 +2012,7 @@ class TensorNameMap:
             "vision_model.transformer.resblocks.{bid}.ln_2", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.post_attention_layernorm", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.norm2", # muse-glimmer
+            "model.omni_model.encoder.layers.{bid}.post_attention_layernorm", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_FFN_UP: (
@@ -2032,6 +2041,7 @@ class TensorNameMap:
             "vision_model.transformer.resblocks.{bid}.mlp.c_fc", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.mlp.up_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.mlp.fc1", # muse-glimmer
+            "model.omni_model.encoder.layers.{bid}.mlp.up_proj", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_FFN_GATE: (
@@ -2042,6 +2052,7 @@ class TensorNameMap:
             "visual.blocks.{bid}.mlp.gate_proj", # qwen2.5vl
             "vision_model.model.layers.{bid}.mlp.gate_proj", # gemma4
             "model.qwen2_model.model.model.layers.{bid}.mlp.gate_proj", # Deepseek-OCR-2 qwen2
+            "model.omni_model.encoder.layers.{bid}.mlp.gate_proj", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_ENC_FFN_DOWN: (
@@ -2070,6 +2081,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.mlp.down_proj", # gemma4
             "vision_model.transformer.resblocks.{bid}.mlp.c_proj", # Step3-VL
             "model.vision_tower.layers.{bid}.mlp.fc2", # muse-glimmer
+            "model.omni_model.encoder.layers.{bid}.mlp.down_proj", # youtu-parsing-omni
         ),
 
 
@@ -2172,6 +2184,7 @@ class TensorNameMap:
             "vision_tower.merger.ln_q", # dots.ocr
             "vision_encoder.adapter.ln_q", # dots3note
             "model.merger.mlp.0.pre_norm", # minicpmv4_6
+            "model.omni_model.vision_merger.norm", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_MM_SOFT_EMB_NORM: (
@@ -2247,10 +2260,12 @@ class TensorNameMap:
 
         MODEL_TENSOR.V_MM_MERGER_FC1: (
             "patch_merge_mlp.linear_1", # minimax-m3
+            "model.omni_model.vision_merger.linear_fc1", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_MM_MERGER_FC2: (
             "patch_merge_mlp.linear_2", # minimax-m3
+            "model.omni_model.vision_merger.linear_fc2", # youtu-parsing-omni
         ),
 
         MODEL_TENSOR.V_DS_NORM: (

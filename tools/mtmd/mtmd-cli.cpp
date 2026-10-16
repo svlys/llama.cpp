@@ -420,6 +420,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     ctx.videos.clear();
 
     // batch encode all media chunks, then decode each
+    mtmd_youtu_fused_audio_reset(ctx.ctx_vision.get());
     size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
     for (size_t i = 0; i < n_chunks; i++) {
         auto chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
@@ -444,7 +445,28 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
         } else {
             // media chunk: try to get embd from existing batch, or create a new batch
             float * embd = nullptr;
-            if (ctx.mbatch) {
+            const mtmd_input_chunk * pair = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
+                ? mtmd_youtu_video_pair_audio(ctx.ctx_vision.get(), chunks.ptr.get(), i) : nullptr;
+            if (pair) {
+                int64_t time_start = ggml_time_ms();
+                LOG_INF("encoding youtu video pair...\n");
+                res = mtmd_encode_youtu_video_pair(ctx.ctx_vision.get(), chunk, pair);
+                if (res != 0) {
+                    LOG_ERR("Failed to encode youtu video pair, res = %d\n", res);
+                    return 1;
+                }
+                LOG_INF("youtu video pair encoded in %d ms\n", (int) (ggml_time_ms() - time_start));
+                embd = mtmd_get_output_embd(ctx.ctx_vision.get());
+            } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO
+                    && mtmd_youtu_fused_audio_ready(ctx.ctx_vision.get(), chunk)) {
+                res = mtmd_encode_chunk(ctx.ctx_vision.get(), chunk);
+                if (res != 0) {
+                    LOG_ERR("Failed to take fused audio embedding, res = %d\n", res);
+                    return 1;
+                }
+                embd = mtmd_get_output_embd(ctx.ctx_vision.get());
+            }
+            if (!embd && ctx.mbatch) {
                 embd = mtmd_batch_get_output_embd(ctx.mbatch.get(), chunk);
 
                 if (embd) {
