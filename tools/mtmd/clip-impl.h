@@ -73,6 +73,8 @@
 #define KEY_WIN_ATTN_PATTERN       "clip.vision.n_wa_pattern"
 #define KEY_WIN_ATTN_LAYER_INDEXES "clip.vision.wa_layer_indexes"
 #define KEY_WA_PATTERN_MODE        "clip.vision.wa_pattern_mode"
+#define KEY_VISION_FUSION_LAYER    "clip.vision.fusion_layer"
+#define KEY_VIDEO_GROUP_ATTENTION  "clip.vision.video_group_attention"
 #define KEY_ATTN_WINDOW_SIZE       "clip.vision.window_size"
 #define KEY_MINICPMV_VERSION       "clip.minicpmv_version"
 #define KEY_MINICPMV_QUERY_NUM     "clip.minicpmv_query_num"
@@ -516,6 +518,7 @@ enum projector_type {
     PROJECTOR_TYPE_GLM4V,
     PROJECTOR_TYPE_GLM5V,
     PROJECTOR_TYPE_YOUTUVL,
+    PROJECTOR_TYPE_YOUTU_OMNI,
     PROJECTOR_TYPE_YASA2,
     PROJECTOR_TYPE_KIMIK25,
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
@@ -590,6 +593,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GLM4V,             "glm4v"},
     { PROJECTOR_TYPE_GLM5V,             "glm5v"},
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
+    { PROJECTOR_TYPE_YOUTU_OMNI,        "youtu_omni"},
     { PROJECTOR_TYPE_YASA2,             "yasa2"},
     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
     { PROJECTOR_TYPE_NEMOTRON_V2_VL,    "nemotron_v2_vl"},
@@ -722,6 +726,67 @@ static inline const std::vector<int> & clip_suffix_rows(clip_suffix_type type) {
     }
 }
 
+// Youtu omni audio: chunks of 100 mel frames, three stride-2 convs, 13 tokens per full chunk.
+// Matches _get_feat_extract_output_lengths. A partial tail uses floor division that stays
+// non-negative, so the leave==0 case is the only one that would need Python's floor div.
+static inline int clip_youtu_omni_audio_tokens(int n_frames) {
+    if (n_frames <= 0) {
+        return 0;
+    }
+    const int n_full = n_frames / 100;
+    const int leave  = n_frames % 100;
+    if (leave == 0) {
+        return n_full * 13;
+    }
+    const int feat  = (leave - 1) / 2 + 1;
+    const int inner = (feat - 1) / 2;
+    return inner / 2 + 1 + n_full * 13;
+}
+
+// One video frame is 100/8 = 12.5 audio tokens on the shared time axis.
+// ggml RoPE positions are int32, so the group graph stores every channel in
+// half-steps and sets freq_scale to 0.5. 12.5 becomes 25.
+inline int clip_youtu_half(int value) {
+    return value * 2;
+}
+
+inline int clip_youtu_frame_half(int frame_index) {
+    return frame_index * 25;
+}
+
+// kind 0 = vision pixels (nx, ny, 3), kind 1 = mel (nx frames, ny bins).
+struct clip_youtu_event {
+    int kind = 0;
+    const float * data = nullptr;
+    int nx = 0;
+    int ny = 0;
+    int valid = 0;
+    int n_out = 0;
+};
+
+struct clip_youtu_span {
+    int kind = 0;
+    int n_tok = 0;
+    int n_out = 0;
+    int pw = 0;
+    int ph = 0;
+};
+
+inline clip_youtu_span clip_youtu_span_of(const clip_youtu_event & ev, int patch, int merge) {
+    clip_youtu_span span;
+    span.kind = ev.kind;
+    span.n_out = ev.n_out;
+    if (ev.kind == 0) {
+        GGML_ASSERT(patch > 0 && merge > 0 && ev.nx % (patch * merge) == 0 && ev.ny % (patch * merge) == 0);
+        span.pw = ev.nx / patch;
+        span.ph = ev.ny / patch;
+        span.n_tok = span.pw * span.ph;
+    } else {
+        span.n_tok = ev.n_out;
+    }
+    return span;
+}
+
 // For images, buf.size() == nx*ny*3
 //     Memory layout: RGBRGBRGB...
 // For seq, buf.size() == nx*ny*3*nt
@@ -737,6 +802,17 @@ struct clip_image_f32 {
     // deepseek4v: number of leading IMAGE_PAD embeddings, aligns IMAGE_START to the LLM compressor ratio
     // depends on the chunk position, set at tokenize time (see mtmd_tokenizer::add_media)
     int32_t lead_pad = 0;
+    // valid mel frames before the conv chunk padding. 0 means "use nx" (already a multiple of 100)
+    int32_t audio_n_frames = 0;
+    // Non-owned mel paired with this frame for youtu video fusion. Null on still
+    // images. The buffer has to stay alive until clip_encode returns.
+    const float * youtu_joint_mel = nullptr;
+    int32_t youtu_joint_mel_frames = 0; // padded mel frames, a multiple of 100
+    int32_t youtu_joint_mel_bins = 0;
+    int32_t youtu_joint_mel_valid = 0;  // frames before that padding
+    // Non-owned group, event order. One graph encodes the whole group.
+    int32_t youtu_n_events = 0;
+    const clip_youtu_event * youtu_events = nullptr;
     // separators appended after the image tokens
     clip_suffix_type suffix_type = CLIP_SUFFIX_NONE;
 

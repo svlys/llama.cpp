@@ -80,6 +80,11 @@ struct clip_graph_youtuvl : clip_graph {
     ggml_cgraph * build() override;
 };
 
+struct clip_graph_youtu_omni : clip_graph {
+    clip_graph_youtu_omni(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
 struct clip_graph_yasa2 : clip_graph {
     clip_graph_yasa2(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;

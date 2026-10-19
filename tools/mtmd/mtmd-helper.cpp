@@ -138,6 +138,63 @@ int32_t mtmd_helper_decode_image_chunk(
     int n_mmproj_embd = llama_model_n_embd_inp(model);
     int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
 
+    if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        const auto * image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+        const size_t nx = image_tokens ? mtmd_image_tokens_get_nx(image_tokens) : 0;
+        const size_t ny = image_tokens ? mtmd_image_tokens_get_ny(image_tokens) : 0;
+        const size_t n_all = image_tokens ? mtmd_image_tokens_get_n_tokens(image_tokens) : 0;
+        // Youtu-Parsing-Omni places one text newline after each merged row.
+        // The vision encoder emits nx*ny embeddings; the extra ny tokens are "\n".
+        if (image_tokens && ny > 0 && nx > 0 && n_all == nx * ny + ny) {
+            const llama_vocab * vocab = llama_model_get_vocab(model);
+            llama_token nl = LLAMA_TOKEN_NULL;
+            const int32_t n_nl = llama_tokenize(vocab, "\n", 1, &nl, 1, false, true);
+            if (n_nl != 1) {
+                LOG_ERR("failed to decode chunk: newline is not a single token\n");
+                return -1;
+            }
+
+            llama_pos cursor = n_past;
+            for (size_t row = 0; row < ny; row++) {
+                const float * row_embd = encoded_embd + row * nx * (size_t) n_mmproj_embd;
+                decode_embd_batch batch_embd(row_embd, (int32_t) nx, n_pos_per_embd, n_mmproj_embd);
+                if (mtmd_decode_use_mrope(ctx)) {
+                    LOG_ERR("failed to decode chunk: youtu omni image rows do not use mrope\n");
+                    return -1;
+                }
+                batch_embd.set_position_normal(cursor, seq_id);
+                int32_t row_i = 0;
+                while (row_i < (int32_t) nx) {
+                    const int n_tokens_batch = std::min(n_batch, (int32_t) nx - row_i);
+                    int32_t ret = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch_embd.render(lctx, row_i, n_tokens_batch));
+                    if (ret != 0) {
+                        LOG_ERR("failed to decode image row\n");
+                        return ret;
+                    }
+                    row_i += n_tokens_batch;
+                }
+                cursor += (llama_pos) nx;
+
+                llama_batch_ext_ptr text_batch(llama_batch_ext_init(lctx));
+                const int32_t idx = llama_batch_ext_add_token(text_batch.get(), seq_id, nl);
+                if (idx < 0) {
+                    LOG_ERR("failed to decode chunk: cannot add row newline\n");
+                    return -1;
+                }
+                llama_batch_ext_set_pos(text_batch.get(), idx, &cursor);
+                int32_t ret = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, text_batch.get());
+                if (ret != 0) {
+                    LOG_ERR("failed to decode image row newline\n");
+                    return ret;
+                }
+                cursor += 1;
+            }
+
+            *new_n_past = cursor;
+            return 0;
+        }
+    }
+
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
     int32_t i_batch = 0;
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
@@ -612,6 +669,23 @@ struct mtmd_helper_video {
     std::string pending_text; // text queued to be returned before the next frame
     bool        start_emitted = false;
 
+    // 1 fps frames interleaved with the audio track. Fusion layers still attend
+    // inside each frame and each audio chunk; cross-modal windows are not built here.
+    bool interleave_audio = false;
+    std::vector<float> pcm;
+    std::vector<mtmd_bitmap *> frames;
+    bool end_emitted = false;
+    int  emit_i     = 0;
+    int  emit_phase = 0;
+
+    ~mtmd_helper_video() {
+        for (auto * frame : frames) {
+            if (frame) {
+                mtmd_bitmap_free(frame);
+            }
+        }
+    }
+
     bool is_buf_input() const {
         return !input_buf.empty();
     }
@@ -804,7 +878,145 @@ struct mtmd_helper_video {
         return frame;
     }
 
+    bool extract_pcm() {
+        std::vector<const char *> cmd;
+        cmd.push_back(ffmpeg_bin.c_str());
+        cmd.push_back("-nostdin");
+        if (is_buf_input()) {
+            cmd.push_back("-read_ahead_limit");
+            cmd.push_back("-1");
+        }
+        cmd.push_back("-i");
+        cmd.push_back(is_buf_input() ? "cache:pipe:0" : path.c_str());
+        cmd.push_back("-vn");
+        cmd.push_back("-ac");
+        cmd.push_back("1");
+        cmd.push_back("-ar");
+        cmd.push_back("16000");
+        cmd.push_back("-f");
+        cmd.push_back("f32le");
+        cmd.push_back("-loglevel");
+        cmd.push_back("error");
+        cmd.push_back("pipe:1");
+        cmd.push_back(nullptr);
+
+        subprocess_handle audio;
+        int ret = subprocess_create(
+            cmd.data(),
+            subprocess_option_search_user_path | subprocess_option_inherit_environment,
+            &audio.proc);
+        audio.created = (ret == 0);
+        audio.alive   = (ret == 0);
+        if (!audio.alive) {
+            return false;
+        }
+        if (is_buf_input()) {
+            audio.start_feeder(input_buf);
+        }
+        FILE * fp = audio.stdout_pipe();
+        const size_t cap = (size_t) 128 * 16000;
+        std::vector<float> buf(4096);
+        while (pcm.size() < cap) {
+            const size_t want = std::min(buf.size(), cap - pcm.size());
+            size_t n = fread(buf.data(), sizeof(float), want, fp);
+            if (n == 0) {
+                break;
+            }
+            pcm.insert(pcm.end(), buf.begin(), buf.begin() + n);
+        }
+        audio.stop();
+        return !pcm.empty();
+    }
+
+    bool drain_frames() {
+        const int cap = 128;
+        while ((int) frames.size() < cap) {
+            mtmd_bitmap * frame = read_next_frame();
+            if (!frame) {
+                break;
+            }
+            mtmd_bitmap_set_mergeable(frame, false);
+            frames.push_back(frame);
+        }
+        stop_ffmpeg();
+        return !frames.empty();
+    }
+
+    static std::string timestamp_hhmmss(int sec) {
+        if (sec < 0) {
+            sec = 0;
+        }
+        const int h = sec / 3600;
+        const int m = (sec % 3600) / 60;
+        const int s = sec % 60;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+        return buf;
+    }
+
+    int32_t read_next_interleaved(mtmd_bitmap ** out_bitmap, char ** out_text) {
+        *out_bitmap = nullptr;
+        *out_text   = nullptr;
+        if (!start_emitted) {
+            start_emitted = true;
+            *out_text = mtmd_strdup("<|video_start|>");
+            return *out_text ? 0 : -2;
+        }
+        const int sr = 16000;
+        const int n_fr = (int) frames.size();
+        const int n_au = pcm.empty() ? 0 : (int) ((pcm.size() + sr - 1) / sr);
+        const int n_slots = std::max(n_fr, n_au);
+        while (emit_i < n_slots) {
+            const bool has_frame = emit_i < n_fr;
+            const bool has_audio = (size_t) emit_i * (size_t) sr < pcm.size();
+            if (emit_phase == 0) {
+                if (!has_frame) {
+                    emit_phase = 2;
+                    continue;
+                }
+                *out_text = mtmd_strdup(timestamp_hhmmss(emit_i));
+                emit_phase = 1;
+                return *out_text ? 0 : -2;
+            }
+            if (emit_phase == 1) {
+                *out_bitmap = frames[emit_i];
+                frames[emit_i] = nullptr;
+                emit_phase = 2;
+                return 0;
+            }
+            if (emit_phase == 2) {
+                if (!has_audio) {
+                    emit_phase = 0;
+                    emit_i++;
+                    continue;
+                }
+                *out_text = mtmd_strdup(timestamp_hhmmss(emit_i));
+                emit_phase = 3;
+                return *out_text ? 0 : -2;
+            }
+            const size_t off = (size_t) emit_i * (size_t) sr;
+            const size_t n = std::min((size_t) sr, pcm.size() - off);
+            *out_bitmap = mtmd_bitmap_init_from_audio(n, pcm.data() + off);
+            if (*out_bitmap && !id.empty()) {
+                const std::string aid = id + "+a" + std::to_string(emit_i);
+                mtmd_bitmap_set_id(*out_bitmap, aid.c_str());
+            }
+            emit_phase = 0;
+            emit_i++;
+            return *out_bitmap ? 0 : -2;
+        }
+        if (!end_emitted) {
+            end_emitted = true;
+            *out_text = mtmd_strdup("<|video_end|>");
+            return *out_text ? 0 : -2;
+        }
+        return -1;
+    }
+
     int32_t read_next(mtmd_bitmap ** out_bitmap, char ** out_text) {
+        if (interleave_audio) {
+            return read_next_interleaved(out_bitmap, out_text);
+        }
         *out_bitmap = nullptr;
         *out_text   = nullptr;
 
@@ -901,6 +1113,17 @@ static std::string video_resolve_bin(const char * bin_dir, const char * name) {
 #ifdef MTMD_VIDEO
 static void mtmd_helper_video_set_id(mtmd_helper_video * vctx, const std::string & id) {
     vctx->id = id;
+    if (id.empty()) {
+        return;
+    }
+    // Frames are read during init, before the file id is known.
+    for (size_t i = 0; i < vctx->frames.size(); i++) {
+        if (!vctx->frames[i] || mtmd_bitmap_get_id(vctx->frames[i])[0] != '\0') {
+            continue;
+        }
+        const std::string frame_id = id + "+" + std::to_string(i);
+        mtmd_bitmap_set_id(vctx->frames[i], frame_id.c_str());
+    }
 }
 
 static mtmd_bitmap * decode_webp_with_ffmpeg(const mtmd_context * mctx, const unsigned char * buf, size_t len, bool placeholder,
@@ -941,15 +1164,27 @@ mtmd_helper_video * mtmd_helper_video_init(
     ctx->ffmpeg_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
     ctx->ffprobe_bin          = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
+    ctx->interleave_audio     = mctx && mtmd_video_interleave_audio(mctx);
+    const float fps = ctx->interleave_audio ? 1.0f : params.fps_target;
 
-    if (!ctx->probe(params.fps_target)) {
+    if (!ctx->probe(fps)) {
         LOG_ERR("%s: ffprobe failed for '%s' (is ffprobe in PATH?)\n", __func__, path);
         delete ctx;
         return nullptr;
     }
 
+    if (ctx->interleave_audio && !ctx->extract_pcm()) {
+        LOG_WRN("%s: no audio track in '%s'\n", __func__, path);
+    }
+
     if (!ctx->start_ffmpeg(0.0f)) {
         LOG_ERR("%s: failed to start ffmpeg for '%s' (is ffmpeg in PATH?)\n", __func__, path);
+        delete ctx;
+        return nullptr;
+    }
+
+    if (ctx->interleave_audio && !ctx->drain_frames()) {
+        LOG_ERR("%s: failed to read frames from '%s'\n", __func__, path);
         delete ctx;
         return nullptr;
     }
@@ -976,15 +1211,27 @@ mtmd_helper_video * mtmd_helper_video_init_from_buf(
     ctx->ffmpeg_bin            = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
     ctx->ffprobe_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
+    ctx->interleave_audio      = mctx && mtmd_video_interleave_audio(mctx);
+    const float fps = ctx->interleave_audio ? 1.0f : params.fps_target;
 
-    if (!ctx->probe(params.fps_target)) {
+    if (!ctx->probe(fps)) {
         LOG_ERR("%s: ffprobe failed on buffer (is ffprobe in PATH?)\n", __func__);
         delete ctx;
         return nullptr;
     }
 
+    if (ctx->interleave_audio && !ctx->extract_pcm()) {
+        LOG_WRN("%s: no audio track in buffer\n", __func__);
+    }
+
     if (!ctx->start_ffmpeg(0.0f)) {
         LOG_ERR("%s: failed to start ffmpeg on buffer (is ffmpeg in PATH?)\n", __func__);
+        delete ctx;
+        return nullptr;
+    }
+
+    if (ctx->interleave_audio && !ctx->drain_frames()) {
+        LOG_ERR("%s: failed to read frames from buffer\n", __func__);
         delete ctx;
         return nullptr;
     }
