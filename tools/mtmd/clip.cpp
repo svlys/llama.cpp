@@ -5395,7 +5395,6 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     const int n_valid = imgs.entries[0].audio_n_frames > 0
                         ? imgs.entries[0].audio_n_frames : image_size_width;
                     const int n_keep = clip_youtu_omni_audio_tokens(n_valid);
-                    const int n_chunks = image_size_width / 100;
                     const int per = n_rot / 3;
                     const int secs[3] = {per, per, n_rot - per * 2};
                     const float base = hparams.rope_theta > 0.0f ? hparams.rope_theta : 10000.0f;
@@ -5409,28 +5408,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     }
                     set_input_f32("youtu_omni_rope_factors", factors);
 
+                    // t is the offset in the packed clip, not inside each 13-token conv chunk.
                     std::vector<int> positions(n_keep * 4, 0);
-                    int ptr = 0;
-                    for (int c = 0; c < n_chunks; c++) {
-                        const int n_this = (c + 1 == n_chunks) ? (n_keep - (n_chunks - 1) * 13) : 13;
-                        for (int t = 0; t < n_this; t++, ptr++) {
-                            positions[ptr] = t;
-                        }
+                    for (int t = 0; t < n_keep; t++) {
+                        positions[t] = t;
                     }
                     set_input_i32("positions", positions);
-
-                    std::vector<float> mask((size_t) n_keep * n_keep, std::numeric_limits<float>::lowest());
-                    int off = 0;
-                    for (int c = 0; c < n_chunks; c++) {
-                        const int n_this = (c + 1 == n_chunks) ? (n_keep - (n_chunks - 1) * 13) : 13;
-                        for (int i = 0; i < n_this; i++) {
-                            for (int j = 0; j < n_this; j++) {
-                                mask[(size_t) (off + i) * n_keep + (off + j)] = 0.0f;
-                            }
-                        }
-                        off += n_this;
-                    }
-                    set_input_attn_mask(mask);
                     break;
                 }
                 const int pw = image_size_width  / patch_size;

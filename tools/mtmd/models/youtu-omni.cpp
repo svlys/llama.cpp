@@ -199,8 +199,8 @@ ggml_cgraph * clip_graph_youtu_omni::build() {
     if (model.modality == CLIP_MODALITY_AUDIO) {
         // Three stride-2 convs over 100-frame chunks, then the shared transformer.
         // Padded tail frames are dropped before attention, matching padded_mask_after_cnn.
-        // Each remaining chunk is its own bidirectional segment. RoPE t restarts at 0
-        // inside the chunk; h and w stay 0. m_dim is 0, so the M channel is unused.
+        // The kept tokens are one bidirectional segment. RoPE t runs 0..n-1
+        // across the whole clip; h and w stay 0. m_dim is 0, so the M channel is unused.
         GGML_ASSERT(model.conv2d_1_w && model.conv2d_2_w && model.conv2d_3_w);
         GGML_ASSERT(model.conv_out_w);
         GGML_ASSERT(model.mm_input_norm_w && model.mm_merger_fc1_w && model.mm_merger_fc2_w);
@@ -267,10 +267,9 @@ ggml_cgraph * clip_graph_youtu_omni::build() {
                 32768, rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         };
 
-        build_vit_opts opts;
-        opts.attn_mask = build_inp_attn_mask(n_keep, n_keep);
+        // One sample is one cu_seqlens segment in forward_audio, so attention is full.
         ggml_tensor * cur = build_vit(
-            inp, n_keep, NORM_TYPE_RMS, FFN_SILU, nullptr, add_pos, opts);
+            inp, n_keep, NORM_TYPE_RMS, FFN_SILU, nullptr, add_pos, {});
 
         // temporal_merge_size is 1: RMSNorm over hidden, then a bias-free GELU MLP.
         cur = build_norm(cur, model.mm_input_norm_w, nullptr, NORM_TYPE_RMS, eps, -1);
